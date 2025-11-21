@@ -1,0 +1,257 @@
+import clr
+import sys
+
+clr.AddReference("RevitAPI")
+clr.AddReference("RevitAPIUI")
+clr.AddReference("PresentationFramework")
+clr.AddReference("PresentationCore")
+clr.AddReference("WindowsBase")
+
+from Autodesk.Revit.DB import (
+    BuiltInCategory,
+    Category,
+    Color,
+    ElementId,
+    FillPatternElement,
+    FillPatternTarget,
+    FilteredElementCollector,
+    OverrideGraphicSettings,
+    Transaction
+)
+from Autodesk.Revit.UI import UIApplication
+
+from System import Byte
+from System.Windows import Window, Thickness, MessageBox, MessageBoxButton, MessageBoxImage, WindowStartupLocation, TextWrapping, HorizontalAlignment
+from System.Windows.Controls import StackPanel, TextBlock, ListBox, Button, WrapPanel, TextBox
+from System.Windows.Controls import SelectionMode, Label
+from System.Windows.Media import SolidColorBrush, Color as MediaColor
+
+uiapp = __revit__
+uidoc = uiapp.ActiveUIDocument
+doc = uidoc.Document
+active_view = uidoc.ActiveView
+
+if active_view is None:
+    sys.exit("No active view found.")
+
+CATEGORY_OPTIONS = [
+    ("Structural Columns", "OST_StructuralColumns"),
+    ("Structural Framing", "OST_StructuralFraming"),
+    ("Structural Foundations", "OST_StructuralFoundation"),
+    ("Structural Stiffeners", "OST_StructuralStiffener"),
+    ("Structural Trusses", "OST_StructuralTruss"),
+    ("Structural Rebar", "OST_Rebar")
+]
+
+class CategoryColorWindow(Window):
+    def __init__(self):
+        Window.__init__(self)
+        self.Title = "Structural Override Options"
+        self.Width = 400
+        self.Height = 500
+        self.WindowStartupLocation = WindowStartupLocation.CenterScreen
+        self.SelectedCategories = []
+        self.SelectedColor = (255, 0, 0)
+        self.ResetRequested = False
+
+        main_panel = StackPanel()
+        main_panel.Margin = Thickness(15)
+        self.Content = main_panel
+
+        info = TextBlock()
+        info.Text = "Select one or more categories and specify RGB color (0-255)."
+        info.TextWrapping = TextWrapping.Wrap
+        main_panel.Children.Add(info)
+
+        self.category_list = ListBox()
+        self.category_list.SelectionMode = SelectionMode.Multiple
+        self.category_list.Margin = Thickness(0, 10, 0, 10)
+        for label, name in CATEGORY_OPTIONS:
+            item = TextBlock()
+            item.Text = label
+            self.category_list.Items.Add(item)
+        main_panel.Children.Add(self.category_list)
+
+        color_label = TextBlock()
+        color_label.Text = "Override Color (RGB):"
+        main_panel.Children.Add(color_label)
+
+        self.color_inputs = []
+        color_names = ["R", "G", "B"]
+        color_values = ["255", "0", "0"]
+        color_panel = WrapPanel()
+        color_panel.Margin = Thickness(0, 5, 0, 10)
+        for name, default in zip(color_names, color_values):
+            panel = StackPanel()
+            panel.Margin = Thickness(5)
+            lbl = Label()
+            lbl.Content = name
+            panel.Children.Add(lbl)
+            tb = TextBox()
+            tb.Width = 50
+            tb.Text = default
+            panel.Children.Add(tb)
+            self.color_inputs.append(tb)
+            color_panel.Children.Add(panel)
+        main_panel.Children.Add(color_panel)
+
+        self.preview = TextBlock()
+        self.preview.Text = "Preview"
+        self.preview.Margin = Thickness(0, 0, 0, 10)
+        self.preview.Padding = Thickness(10)
+        self.preview.Background = SolidColorBrush(MediaColor.FromRgb(255, 0, 0))
+        main_panel.Children.Add(self.preview)
+
+        button_panel = WrapPanel()
+        button_panel.HorizontalAlignment = HorizontalAlignment.Center
+        ok_button = Button()
+        ok_button.Content = "Apply"
+        ok_button.Margin = Thickness(5)
+        ok_button.Click += self.on_ok
+        reset_button = Button()
+        reset_button.Content = "Reset Overrides"
+        reset_button.Margin = Thickness(5)
+        reset_button.Click += self.on_reset
+        cancel_button = Button()
+        cancel_button.Content = "Cancel"
+        cancel_button.Margin = Thickness(5)
+        cancel_button.Click += self.on_cancel
+        button_panel.Children.Add(ok_button)
+        button_panel.Children.Add(reset_button)
+        button_panel.Children.Add(cancel_button)
+        main_panel.Children.Add(button_panel)
+
+        for tb in self.color_inputs:
+            tb.TextChanged += self.update_preview
+
+    def update_preview(self, sender, args):
+        rgb = self._read_color_inputs()
+        self.preview.Background = SolidColorBrush(MediaColor.FromRgb(*rgb))
+
+    def _read_color_inputs(self):
+        values = []
+        for tb in self.color_inputs:
+            try:
+                val = int(tb.Text)
+            except:
+                val = 0
+            val = max(0, min(255, val))
+            tb.Text = str(val)
+            values.append(val)
+        return tuple(values)
+
+    def on_ok(self, sender, args):
+        selected_indices = self.category_list.SelectedItems
+        if selected_indices.Count == 0:
+            MessageBox.Show("Select at least one category.", "Input Required", MessageBoxButton.OK, MessageBoxImage.Warning)
+            return
+        self.SelectedCategories = []
+        for item in selected_indices:
+            label = item.Text
+            for option in CATEGORY_OPTIONS:
+                if option[0] == label:
+                    self.SelectedCategories.append(option[1])
+                    break
+        self.SelectedColor = self._read_color_inputs()
+        self.DialogResult = True
+        self.Close()
+
+    def on_cancel(self, sender, args):
+        self.DialogResult = False
+        self.Close()
+
+    def on_reset(self, sender, args):
+        self.ResetRequested = True
+        self.DialogResult = True
+        self.Close()
+
+def resolve_categories(names):
+    categories = []
+    for name in names:
+        bic = getattr(BuiltInCategory, name, None)
+        if bic is not None:
+            try:
+                cat = doc.Settings.Categories.get_Item(bic)
+                if cat:
+                    categories.append(cat)
+            except:
+                continue
+    return categories
+
+def get_solid_fill_pattern_id(document):
+    collector = FilteredElementCollector(document).OfClass(FillPatternElement)
+    for element in collector:
+        pattern = element.GetFillPattern()
+        try:
+            is_solid = pattern.IsSolidFill
+        except:
+            is_solid = pattern.IsSolidFilled if hasattr(pattern, "IsSolidFilled") else False
+        if is_solid and pattern.Target == FillPatternTarget.Drafting:
+            return element.Id
+    return ElementId.InvalidElementId
+
+def build_override_settings(document, rgb):
+    ogs = OverrideGraphicSettings()
+    color = Color(Byte(rgb[0]), Byte(rgb[1]), Byte(rgb[2]))
+    solid_id = get_solid_fill_pattern_id(document)
+    ogs.SetCutLineColor(color)
+    ogs.SetProjectionLineColor(color)
+    ogs.SetCutForegroundPatternColor(color)
+    ogs.SetProjectionLineWeight(6)
+    ogs.SetCutLineWeight(6)
+    if solid_id != ElementId.InvalidElementId:
+        ogs.SetCutForegroundPatternId(solid_id)
+        ogs.SetSurfaceForegroundPatternId(solid_id)
+        ogs.SetSurfaceForegroundPatternColor(color)
+    return ogs
+
+def override_categories(view, categories, settings):
+    for cat in categories:
+        if not cat:
+            continue
+        can_override = True
+        if hasattr(view, "CanCategoryBeOverridden"):
+            can_override = view.CanCategoryBeOverridden(cat.Id)
+        elif hasattr(view, "CanCategoryBeHidden"):
+            can_override = view.CanCategoryBeHidden(cat.Id)
+        if can_override:
+            view.SetCategoryOverrides(cat.Id, settings)
+
+window = CategoryColorWindow()
+result = window.ShowDialog()
+if not result:
+    sys.exit("Override cancelled by user.")
+
+if window.ResetRequested:
+    tx = Transaction(doc, "Reset Category Overrides")
+    try:
+        tx.Start()
+        default_ogs = OverrideGraphicSettings()
+        for cat in doc.Settings.Categories:
+            try:
+                active_view.SetCategoryOverrides(cat.Id, default_ogs)
+            except:
+                continue
+        tx.Commit()
+    except:
+        if tx.HasStarted():
+            tx.RollBack()
+        raise
+    print("Overrides reset in view '{}'.".format(active_view.Name))
+else:
+    selected_categories = resolve_categories(window.SelectedCategories)
+    if not selected_categories:
+        sys.exit("No valid categories selected.")
+
+    tx = Transaction(doc, "Override Structural Categories")
+    try:
+        tx.Start()
+        ogs = build_override_settings(doc, window.SelectedColor)
+        override_categories(active_view, selected_categories, ogs)
+        tx.Commit()
+    except:
+        if tx.HasStarted():
+            tx.RollBack()
+        raise
+
+    print("Selected categories have been overridden in view '{}'.".format(active_view.Name))
